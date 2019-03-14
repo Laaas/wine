@@ -1306,12 +1306,10 @@ static void test_NtMapViewOfSection(void)
     ok( result == sizeof(buffer), "ReadProcessMemory didn't read all data (%lx)\n", result );
     ok( !memcmp( buffer, data, sizeof(buffer) ), "Wrong data read\n" );
 
-    /* for some unknown reason NtMapViewOfSection fails with STATUS_NO_MEMORY when zero_bits != 0 ? */
     ptr2 = NULL;
     size = 0;
     offset.QuadPart = 0;
     status = pNtMapViewOfSection( mapping, hProcess, &ptr2, 12, 0, &offset, &size, 1, 0, PAGE_READWRITE );
-    todo_wine
     ok( status == STATUS_NO_MEMORY, "NtMapViewOfSection returned %x\n", status );
     if (status == STATUS_SUCCESS)
     {
@@ -1322,7 +1320,6 @@ static void test_NtMapViewOfSection(void)
     ptr2 = NULL;
     size = 0;
     status = pNtMapViewOfSection( mapping, hProcess, &ptr2, 16, 0, &offset, &size, 1, 0, PAGE_READWRITE );
-    todo_wine
     ok( status == STATUS_NO_MEMORY, "NtMapViewOfSection returned %x\n", status );
     if (status == STATUS_SUCCESS)
     {

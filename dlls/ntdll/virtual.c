@@ -1066,6 +1066,98 @@ static NTSTATUS map_fixed_area( void *base, size_t size, unsigned int vprot )
     return STATUS_SUCCESS;
 }
 
+/*
+ * The functions `mmap_probe_seed` and `mmap_probe` were ripped
+ * out from LuaJIT, and are subject to the following license:
+ *
+ * Link to source: https://github.com/LuaJIT/LuaJIT/blob/f0e865dd4861520258299d0f2a56491bd9d602e1/src/lj_alloc.c#L248
+ *
+ * ===============================================================================
+ * LuaJIT -- a Just-In-Time Compiler for Lua. http://luajit.org/
+ *
+ * Copyright (C) 2005-2017 Mike Pall. All rights reserved.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ *
+ * [ MIT license: http://www.opensource.org/licenses/mit-license.php ]
+ * ===============================================================================
+ */
+
+static UINT_PTR mmap_probe_seed(void)
+{
+    UINT_PTR val;
+    int fd = open( "/dev/urandom", O_RDONLY );
+    if (fd != -1) {
+        int ok = ((size_t)read( fd, &val, sizeof(val)) == sizeof(val) );
+        (void)close( fd );
+        if (ok) return val;
+    }
+    return 1; /* Punt. */
+}
+
+static void *mmap_probe( size_t size, int prot, int flags, int bits )
+{
+    const UINT_PTR hint_def = 0;
+    /* Hint for next allocation. Doesn't need to be thread-safe. */
+    static UINT_PTR hint_addr = hint_def;
+    static UINT_PTR hint_prng = 0;
+    int retry;
+    for (retry = 0; retry < 30; retry++) {
+        void *p = wine_anon_mmap( (void *)hint_addr, size, prot, flags );
+        UINT_PTR addr = (UINT_PTR)p;
+        if ((addr >> bits) == 0) {
+            /* We got a suitable address. Bump the hint address. */
+            hint_addr = addr + size;
+            return p;
+        }
+        if (p != MAP_FAILED) {
+            munmap( p, size );
+        } else if (errno == ENOMEM) {
+            return MAP_FAILED;
+        }
+        if (hint_addr != hint_def) {
+            /* First, try linear probing. */
+            if (retry < 5) {
+                hint_addr += 0x1000000;
+                if (((hint_addr + size) >> bits) != 0) hint_addr = hint_def;
+                continue;
+            } else if (retry == 5) {
+                /* Next, try a no-hint probe to get back an ASLR address. */
+                hint_addr = hint_def;
+                continue;
+            }
+        }
+        /* Finally, try pseudo-random probing. */
+        if (hint_prng == 0) {
+            hint_prng = mmap_probe_seed();
+        }
+        /* The unsuitable address we got has some ASLR PRNG bits. */
+        hint_addr ^= addr;
+        /* The PRNG itself is very weak, but see above. */
+        hint_prng = hint_prng * 1103515245 + 12345;
+        hint_addr ^= hint_prng * (UINT_PTR)0x1000;
+        hint_addr &= (((UINT_PTR)1 << bits)-1);
+    }
+    errno = ENOMEM; /* Out of address space */
+    return MAP_FAILED;
+}
+
 /***********************************************************************
  *           map_view
  *
@@ -1073,7 +1165,7 @@ static NTSTATUS map_fixed_area( void *base, size_t size, unsigned int vprot )
  * The csVirtual section must be held by caller.
  */
 static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size, size_t mask,
-                          int top_down, unsigned int vprot )
+                          int top_down, unsigned int vprot, ULONG zero_bits )
 {
     void *ptr;
     NTSTATUS status;
@@ -1094,7 +1186,7 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size, 
         alloc.size = size;
         alloc.mask = mask;
         alloc.top_down = top_down;
-        alloc.limit = user_space_limit;
+        alloc.limit = zero_bits ? (void *)min((UINT_PTR)user_space_limit, (UINT_PTR)1 << (32 - zero_bits)) : user_space_limit;
         if (wine_mmap_enum_reserved_areas( alloc_reserved_area_callback, &alloc, top_down ))
         {
             ptr = alloc.result;
@@ -1106,7 +1198,8 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size, 
 
         for (;;)
         {
-            if ((ptr = wine_anon_mmap( NULL, view_size, VIRTUAL_GetUnixProt(vprot), 0 )) == (void *)-1)
+            if ((ptr = mmap_probe( view_size, VIRTUAL_GetUnixProt(vprot), 0,
+                                   (32 - zero_bits) % 32)) == (void *)-1)
             {
                 if (errno == ENOMEM) return STATUS_NO_MEMORY;
                 return STATUS_INVALID_PARAMETER;
@@ -1274,7 +1367,7 @@ static NTSTATUS allocate_dos_memory( struct file_view **view, unsigned int vprot
         if (addr != low_64k)
         {
             if (addr != (void *)-1) munmap( addr, dosmem_size - 0x10000 );
-            return map_view( view, NULL, dosmem_size, 0xffff, 0, vprot );
+            return map_view( view, NULL, dosmem_size, 0xffff, 0, vprot, 0 );
         }
     }
 
@@ -1348,7 +1441,8 @@ static NTSTATUS map_pe_header( void *ptr, size_t size, int fd, BOOL *removable )
  * Map an executable (PE format) image into memory.
  */
 static NTSTATUS map_image( HANDLE hmapping, ACCESS_MASK access, int fd, SIZE_T mask,
-                           pe_image_info_t *image_info, int shared_fd, BOOL removable, PVOID *addr_ptr )
+                           pe_image_info_t *image_info, int shared_fd, BOOL removable, PVOID *addr_ptr,
+                           ULONG zero_bits )
 {
     IMAGE_DOS_HEADER *dos;
     IMAGE_NT_HEADERS *nt;
@@ -1378,11 +1472,11 @@ static NTSTATUS map_image( HANDLE hmapping, ACCESS_MASK access, int fd, SIZE_T m
 
     if (base >= (char *)address_space_start)  /* make sure the DOS area remains free */
         status = map_view( &view, base, total_size, mask, FALSE, SEC_IMAGE | SEC_FILE |
-                           VPROT_COMMITTED | VPROT_READ | VPROT_EXEC | VPROT_WRITECOPY );
+                           VPROT_COMMITTED | VPROT_READ | VPROT_EXEC | VPROT_WRITECOPY, zero_bits );
 
     if (status != STATUS_SUCCESS)
         status = map_view( &view, NULL, total_size, mask, FALSE, SEC_IMAGE | SEC_FILE |
-                           VPROT_COMMITTED | VPROT_READ | VPROT_EXEC | VPROT_WRITECOPY );
+                           VPROT_COMMITTED | VPROT_READ | VPROT_EXEC | VPROT_WRITECOPY, zero_bits );
 
     if (status != STATUS_SUCCESS) goto error;
 
@@ -1660,13 +1754,13 @@ NTSTATUS virtual_map_section( HANDLE handle, PVOID *addr_ptr, ULONG zero_bits, S
             if ((res = server_get_unix_fd( shared_file, FILE_READ_DATA|FILE_WRITE_DATA,
                                            &shared_fd, &shared_needs_close, NULL, NULL ))) goto done;
             res = map_image( handle, access, unix_handle, default_alignment_mask, image_info,
-                             shared_fd, needs_close, addr_ptr );
+                             shared_fd, needs_close, addr_ptr, zero_bits );
             if (shared_needs_close) close( shared_fd );
             close_handle( shared_file );
         }
         else
         {
-            res = map_image( handle, access, unix_handle, default_alignment_mask, image_info, -1, needs_close, addr_ptr );
+            res = map_image( handle, access, unix_handle, default_alignment_mask, image_info, -1, needs_close, addr_ptr, zero_bits );
         }
         if (needs_close) close( unix_handle );
         if (res >= 0) *size_ptr = image_info->map_size;
@@ -1703,7 +1797,7 @@ NTSTATUS virtual_map_section( HANDLE handle, PVOID *addr_ptr, ULONG zero_bits, S
     get_vprot_flags( protect, &vprot, sec_flags & SEC_IMAGE );
     vprot |= sec_flags;
     if (!(sec_flags & SEC_RESERVE)) vprot |= VPROT_COMMITTED;
-    res = map_view( &view, *addr_ptr, size, default_alignment_mask, FALSE, vprot );
+    res = map_view( &view, *addr_ptr, size, default_alignment_mask, FALSE, vprot, zero_bits );
     if (res)
     {
         server_leave_uninterrupted_section( &csVirtual, &sigset );
@@ -1936,7 +2030,7 @@ NTSTATUS virtual_alloc_thread_stack( TEB *teb, SIZE_T reserve_size, SIZE_T commi
     server_enter_uninterrupted_section( &csVirtual, &sigset );
 
     if ((status = map_view( &view, NULL, size + extra_size, 0xffff, 0,
-                            VPROT_READ | VPROT_WRITE | VPROT_COMMITTED )) != STATUS_SUCCESS)
+                            VPROT_READ | VPROT_WRITE | VPROT_COMMITTED, 0 )) != STATUS_SUCCESS)
         goto done;
 
 #ifdef VALGRIND_STACK_REGISTER
@@ -2468,8 +2562,8 @@ NTSTATUS virtual_alloc( HANDLE process, PVOID *ret, ULONG zero_bits,
     mask = (1 << alignment) - 1;
 
     if (!size) return STATUS_INVALID_PARAMETER;
-    /* Unimplemented */
-    if (zero_bits)
+    /* If zero_bits is too large for the the alignment, the only possible address will be null */
+    if (zero_bits && (zero_bits > (32 - alignment) || *ret))
         return STATUS_INVALID_PARAMETER_3;
 
     if (process != NtCurrentProcess())
@@ -2547,7 +2641,7 @@ NTSTATUS virtual_alloc( HANDLE process, PVOID *ret, ULONG zero_bits,
 
             if (vprot & VPROT_WRITECOPY) status = STATUS_INVALID_PAGE_PROTECTION;
             else if (is_dos_memory) status = allocate_dos_memory( &view, vprot );
-            else status = map_view( &view, base, size, mask, type & MEM_TOP_DOWN, vprot );
+            else status = map_view( &view, base, size, mask, type & MEM_TOP_DOWN, vprot, zero_bits );
 
             if (status == STATUS_SUCCESS) base = view->base;
         }
@@ -3097,8 +3191,11 @@ NTSTATUS WINAPI NtMapViewOfSection( HANDLE handle, HANDLE process, PVOID *addr_p
 
     /* Check parameters */
 
-    /* Unimplemented */
-    if (zero_bits)
+    /* zero_bits is ignored if we request a specific address */
+    if (*addr_ptr) zero_bits = 0;
+
+    /* If zero_bits is too large for the the alignment, the only possible address will be null */
+    if (zero_bits && zero_bits > 32 - default_alignment)
         return STATUS_INVALID_PARAMETER_4;
 
 #ifndef _WIN64
