@@ -511,7 +511,7 @@ static LPOFNHOOKPROC alloc_hook( LPOFNHOOKPROC16 hook16 )
     SIZE_T size = 0x1000;
     unsigned int i;
 
-    if (!hooks && NtAllocateVirtualMemory( GetCurrentProcess(), (void **)&hooks, 12, &size,
+    if (!hooks && NtAllocateVirtualMemory( GetCurrentProcess(), (void **)&hooks, 0, &size,
                                            MEM_COMMIT, PAGE_EXECUTE_READWRITE ))
         return NULL;
 
