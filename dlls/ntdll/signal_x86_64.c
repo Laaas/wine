@@ -3276,8 +3276,8 @@ NTSTATUS signal_alloc_thread( TEB **teb )
 
     size = 1 << sigstack_zero_bits;
     *teb = NULL;
-    if (!(status = NtAllocateVirtualMemory( NtCurrentProcess(), (void **)teb, sigstack_zero_bits,
-                                            &size, MEM_COMMIT | MEM_TOP_DOWN, PAGE_READWRITE )))
+    if (!(status = virtual_alloc( NtCurrentProcess(), (void **)teb, 0, &size,
+                                  MEM_COMMIT | MEM_TOP_DOWN, PAGE_READWRITE, sigstack_zero_bits )))
     {
         (*teb)->Tib.Self = &(*teb)->Tib;
         (*teb)->Tib.ExceptionList = (void *)~0UL;

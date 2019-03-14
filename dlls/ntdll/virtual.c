@@ -119,6 +119,8 @@ static RTL_CRITICAL_SECTION_DEBUG critsect_debug =
 };
 static RTL_CRITICAL_SECTION csVirtual = { &critsect_debug, -1, 0, 0, 0, 0 };
 
+static const UINT default_alignment = 16;
+static const UINT_PTR default_alignment_mask = 0xffff;
 #ifdef __i386__
 static const UINT page_shift = 12;
 static const UINT_PTR page_mask = 0xfff;
@@ -403,18 +405,6 @@ static struct file_view *VIRTUAL_FindView( const void *addr, size_t size )
         else return view;
     }
     return NULL;
-}
-
-
-/***********************************************************************
- *           get_mask
- */
-static inline UINT_PTR get_mask( ULONG zero_bits )
-{
-    if (!zero_bits) return 0xffff;  /* allocations are aligned to 64K by default */
-    if (zero_bits < page_shift) zero_bits = page_shift;
-    if (zero_bits > 21) return 0;
-    return (1 << zero_bits) - 1;
 }
 
 
@@ -1614,7 +1604,7 @@ NTSTATUS virtual_map_section( HANDLE handle, PVOID *addr_ptr, ULONG zero_bits, S
     NTSTATUS res;
     mem_size_t full_size;
     ACCESS_MASK access;
-    SIZE_T size, mask = get_mask( zero_bits );
+    SIZE_T size;
     int unix_handle = -1, needs_close;
     unsigned int vprot, sec_flags;
     struct file_view *view;
@@ -1669,14 +1659,14 @@ NTSTATUS virtual_map_section( HANDLE handle, PVOID *addr_ptr, ULONG zero_bits, S
 
             if ((res = server_get_unix_fd( shared_file, FILE_READ_DATA|FILE_WRITE_DATA,
                                            &shared_fd, &shared_needs_close, NULL, NULL ))) goto done;
-            res = map_image( handle, access, unix_handle, mask, image_info,
+            res = map_image( handle, access, unix_handle, default_alignment_mask, image_info,
                              shared_fd, needs_close, addr_ptr );
             if (shared_needs_close) close( shared_fd );
             close_handle( shared_file );
         }
         else
         {
-            res = map_image( handle, access, unix_handle, mask, image_info, -1, needs_close, addr_ptr );
+            res = map_image( handle, access, unix_handle, default_alignment_mask, image_info, -1, needs_close, addr_ptr );
         }
         if (needs_close) close( unix_handle );
         if (res >= 0) *size_ptr = image_info->map_size;
@@ -1713,7 +1703,7 @@ NTSTATUS virtual_map_section( HANDLE handle, PVOID *addr_ptr, ULONG zero_bits, S
     get_vprot_flags( protect, &vprot, sec_flags & SEC_IMAGE );
     vprot |= sec_flags;
     if (!(sec_flags & SEC_RESERVE)) vprot |= VPROT_COMMITTED;
-    res = map_view( &view, *addr_ptr, size, mask, FALSE, vprot );
+    res = map_view( &view, *addr_ptr, size, default_alignment_mask, FALSE, vprot );
     if (res)
     {
         server_leave_uninterrupted_section( &csVirtual, &sigset );
@@ -1870,7 +1860,7 @@ void virtual_get_system_info( SYSTEM_BASIC_INFORMATION *info )
     }
 #endif
     info->MmNumberOfPhysicalPages = info->MmHighestPhysicalPage - info->MmLowestPhysicalPage;
-    info->AllocationGranularity   = get_mask(0) + 1;
+    info->AllocationGranularity   = 1 << default_alignment;
     info->LowestUserAddress       = (void *)0x10000;
     info->HighestUserAddress      = (char *)user_space_limit - 1;
     info->ActiveProcessorsAffinityMask = get_system_affinity_mask();
@@ -2455,25 +2445,32 @@ void virtual_set_large_address_space(void)
 
 
 /***********************************************************************
- *             NtAllocateVirtualMemory   (NTDLL.@)
- *             ZwAllocateVirtualMemory   (NTDLL.@)
+ *             virtual_alloc
+ *
+ * Allocate virtual memory at address given with the given alignment
+ * and pointer size restrictions.
  */
-NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG zero_bits,
-                                         SIZE_T *size_ptr, ULONG type, ULONG protect )
+NTSTATUS virtual_alloc( HANDLE process, PVOID *ret, ULONG zero_bits,
+                        SIZE_T *size_ptr, ULONG type, ULONG protect, ULONG alignment )
 {
     void *base;
     unsigned int vprot;
     SIZE_T size = *size_ptr;
-    SIZE_T mask = get_mask( zero_bits );
+    SIZE_T mask;
     NTSTATUS status = STATUS_SUCCESS;
     BOOL is_dos_memory = FALSE;
     struct file_view *view;
     sigset_t sigset;
 
-    TRACE("%p %p %08lx %x %08x\n", process, *ret, size, type, protect );
+    TRACE("%p %p %i %08lx %x %08x %i\n", process, *ret, zero_bits, size, type, protect, alignment );
+
+    alignment = max( alignment, page_shift );
+    mask = (1 << alignment) - 1;
 
     if (!size) return STATUS_INVALID_PARAMETER;
-    if (!mask) return STATUS_INVALID_PARAMETER_3;
+    /* Unimplemented */
+    if (zero_bits)
+        return STATUS_INVALID_PARAMETER_3;
 
     if (process != NtCurrentProcess())
     {
@@ -2505,7 +2502,7 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG zero_
 
     if (*ret)
     {
-        if (type & MEM_RESERVE) /* Round down to 64k boundary */
+        if (type & MEM_RESERVE)
             base = ROUND_ADDR( *ret, mask );
         else
             base = ROUND_ADDR( *ret, page_mask );
@@ -2587,6 +2584,16 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG zero_
         *size_ptr = size;
     }
     return status;
+}
+
+/***********************************************************************
+ *             NtAllocateVirtualMemory   (NTDLL.@)
+ *             ZwAllocateVirtualMemory   (NTDLL.@)
+ */
+NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG zero_bits,
+                                         SIZE_T *size_ptr, ULONG type, ULONG protect )
+{
+	return virtual_alloc(process, ret, zero_bits, size_ptr, type, protect, default_alignment);
 }
 
 
@@ -3079,7 +3086,7 @@ NTSTATUS WINAPI NtMapViewOfSection( HANDLE handle, HANDLE process, PVOID *addr_p
                                     SECTION_INHERIT inherit, ULONG alloc_type, ULONG protect )
 {
     NTSTATUS res;
-    SIZE_T mask = get_mask( zero_bits );
+    SIZE_T mask = default_alignment_mask;
     pe_image_info_t image_info;
     LARGE_INTEGER offset;
 
@@ -3090,7 +3097,8 @@ NTSTATUS WINAPI NtMapViewOfSection( HANDLE handle, HANDLE process, PVOID *addr_p
 
     /* Check parameters */
 
-    if ((*addr_ptr && zero_bits) || !mask)
+    /* Unimplemented */
+    if (zero_bits)
         return STATUS_INVALID_PARAMETER_4;
 
 #ifndef _WIN64

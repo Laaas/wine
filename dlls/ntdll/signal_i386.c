@@ -2311,8 +2311,8 @@ NTSTATUS signal_alloc_thread( TEB **teb )
     }
 
     size = signal_stack_mask + 1;
-    if (!(status = NtAllocateVirtualMemory( NtCurrentProcess(), &addr, sigstack_zero_bits,
-                                            &size, MEM_COMMIT | MEM_TOP_DOWN, PAGE_READWRITE )))
+    if (!(status = virtual_alloc( NtCurrentProcess(), &addr, 0, &size,
+                                  MEM_COMMIT | MEM_TOP_DOWN, PAGE_READWRITE, sigstack_zero_bits )))
     {
         *teb = addr;
         (*teb)->Tib.Self = &(*teb)->Tib;

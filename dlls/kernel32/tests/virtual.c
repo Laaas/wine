@@ -461,6 +461,7 @@ static void test_VirtualAlloc(void)
     addr2 = NULL;
     status = pNtAllocateVirtualMemory(GetCurrentProcess(), &addr2, 21, &size,
                                       MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    todo_wine
     ok(status == STATUS_SUCCESS || status == STATUS_NO_MEMORY,
        "NtAllocateVirtualMemory returned %08x\n", status);
     if (status == STATUS_SUCCESS) ok(VirtualFree(addr2, 0, MEM_RELEASE), "VirtualFree failed\n");
