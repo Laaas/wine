@@ -447,32 +447,12 @@ static void test_VirtualAlloc(void)
                                       MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
     ok(status == STATUS_CONFLICTING_ADDRESSES, "NtAllocateVirtualMemory returned %08x\n", status);
 
-    /* it should conflict, even when zero_bits is explicitly set */
-    size = 0x1000;
-    addr2 = (char *)addr1 + 0x1000;
-    status = pNtAllocateVirtualMemory(GetCurrentProcess(), &addr2, 12, &size,
-                                      MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
-    todo_wine
-    ok(status == STATUS_CONFLICTING_ADDRESSES, "NtAllocateVirtualMemory returned %08x\n", status);
-    if (status == STATUS_SUCCESS) ok(VirtualFree(addr2, 0, MEM_RELEASE), "VirtualFree failed\n");
-
-    /* 21 zero bits is valid */
+    /* allocate memory with 31-bit address */
     size = 0x1000;
     addr2 = NULL;
-    status = pNtAllocateVirtualMemory(GetCurrentProcess(), &addr2, 21, &size,
+    status = pNtAllocateVirtualMemory(GetCurrentProcess(), &addr2, 1, &size,
                                       MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
-    todo_wine
-    ok(status == STATUS_SUCCESS || status == STATUS_NO_MEMORY,
-       "NtAllocateVirtualMemory returned %08x\n", status);
-    if (status == STATUS_SUCCESS) ok(VirtualFree(addr2, 0, MEM_RELEASE), "VirtualFree failed\n");
-
-    /* 22 zero bits is invalid */
-    size = 0x1000;
-    addr2 = NULL;
-    status = pNtAllocateVirtualMemory(GetCurrentProcess(), &addr2, 22, &size,
-                                      MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
-    ok(status == STATUS_INVALID_PARAMETER_3, "NtAllocateVirtualMemory returned %08x\n", status);
-    if (status == STATUS_SUCCESS) ok(VirtualFree(addr2, 0, MEM_RELEASE), "VirtualFree failed\n");
+    ok(status == STATUS_SUCCESS && (UINT_PTR)addr2 >> 31 == 0, "NtAllocateVirtualMemory returned status %08x and pointer %p\n", status, addr2);
 
     /* AT_ROUND_TO_PAGE flag is not supported for VirtualAlloc */
     SetLastError(0xdeadbeef);
@@ -1306,37 +1286,21 @@ static void test_NtMapViewOfSection(void)
     ok( result == sizeof(buffer), "ReadProcessMemory didn't read all data (%lx)\n", result );
     ok( !memcmp( buffer, data, sizeof(buffer) ), "Wrong data read\n" );
 
-    ptr2 = NULL;
+    status = pNtUnmapViewOfSection( hProcess, ptr );
+    ok( !status, "NtUnmapViewOfSection failed status %x\n", status );
+
+    ptr = NULL;
     size = 0;
     offset.QuadPart = 0;
-    status = pNtMapViewOfSection( mapping, hProcess, &ptr2, 12, 0, &offset, &size, 1, 0, PAGE_READWRITE );
-    ok( status == STATUS_NO_MEMORY, "NtMapViewOfSection returned %x\n", status );
-    if (status == STATUS_SUCCESS)
-    {
-        status = pNtUnmapViewOfSection( hProcess, ptr2 );
-        ok( !status, "NtUnmapViewOfSection failed status %x\n", status );
-    }
+    status = pNtMapViewOfSection( mapping, hProcess, &ptr, 1, 0, &offset, &size, 1, 0, PAGE_READWRITE );
+    ok( !status, "NtMapViewOfSection failed status %x\n", status );
+    ok( !((ULONG_PTR)ptr & 0xffff), "returned memory %p is not aligned to 64k\n", ptr );
+    ok( (ULONG_PTR)ptr >> 31 == 0, "returned pointer %p is longer than 31 bits\n", ptr );
 
-    ptr2 = NULL;
-    size = 0;
-    status = pNtMapViewOfSection( mapping, hProcess, &ptr2, 16, 0, &offset, &size, 1, 0, PAGE_READWRITE );
-    ok( status == STATUS_NO_MEMORY, "NtMapViewOfSection returned %x\n", status );
-    if (status == STATUS_SUCCESS)
-    {
-        status = pNtUnmapViewOfSection( hProcess, ptr2 );
-        ok( !status, "NtUnmapViewOfSection failed status %x\n", status );
-    }
-
-    /* 22 zero bits isn't acceptable */
-    ptr2 = NULL;
-    size = 0;
-    status = pNtMapViewOfSection( mapping, hProcess, &ptr2, 22, 0, &offset, &size, 1, 0, PAGE_READWRITE );
-    ok( status == STATUS_INVALID_PARAMETER_4, "NtMapViewOfSection returned %x\n", status );
-    if (status == STATUS_SUCCESS)
-    {
-        status = pNtUnmapViewOfSection( hProcess, ptr2 );
-        ok( !status, "NtUnmapViewOfSection failed status %x\n", status );
-    }
+    ret = ReadProcessMemory( hProcess, ptr, buffer, sizeof(buffer), &result );
+    ok( ret, "ReadProcessMemory failed\n" );
+    ok( result == sizeof(buffer), "ReadProcessMemory didn't read all data (%lx)\n", result );
+    ok( !memcmp( buffer, data, sizeof(buffer) ), "Wrong data read\n" );
 
     /* mapping at the same page conflicts */
     ptr2 = ptr;
@@ -1366,30 +1330,15 @@ static void test_NtMapViewOfSection(void)
     status = pNtMapViewOfSection( mapping, hProcess, &ptr2, 0, 0, &offset, &size, 1, 0, PAGE_READWRITE );
     ok( status == STATUS_MAPPED_ALIGNMENT, "NtMapViewOfSection returned %x\n", status );
 
-    /* zero_bits != 0 is not allowed when an address is set */
-    ptr2 = (char *)ptr + 0x1000;
+    /* zero_bits is ignored when an address is set */
+    ptr2 = (char *)ptr + 0x10000;
     size = 0;
     offset.QuadPart = 0;
-    status = pNtMapViewOfSection( mapping, hProcess, &ptr2, 12, 0, &offset, &size, 1, 0, PAGE_READWRITE );
-    ok( status == STATUS_INVALID_PARAMETER_4, "NtMapViewOfSection returned %x\n", status );
+    status = pNtMapViewOfSection( mapping, hProcess, &ptr2, (ULONG)-1, 0, &offset, &size, 1, 0, PAGE_READWRITE );
+    ok( status == STATUS_SUCCESS, "NtMapViewOfSection returned %x\n", status );
 
-    ptr2 = (char *)ptr + 0x1000;
-    size = 0;
-    offset.QuadPart = 0;
-    status = pNtMapViewOfSection( mapping, hProcess, &ptr2, 16, 0, &offset, &size, 1, 0, PAGE_READWRITE );
-    ok( status == STATUS_INVALID_PARAMETER_4, "NtMapViewOfSection returned %x\n", status );
-
-    ptr2 = (char *)ptr + 0x1001;
-    size = 0;
-    offset.QuadPart = 0;
-    status = pNtMapViewOfSection( mapping, hProcess, &ptr2, 16, 0, &offset, &size, 1, 0, PAGE_READWRITE );
-    ok( status == STATUS_INVALID_PARAMETER_4, "NtMapViewOfSection returned %x\n", status );
-
-    ptr2 = (char *)ptr + 0x1000;
-    size = 0;
-    offset.QuadPart = 1;
-    status = pNtMapViewOfSection( mapping, hProcess, &ptr2, 16, 0, &offset, &size, 1, 0, PAGE_READWRITE );
-    ok( status == STATUS_INVALID_PARAMETER_4, "NtMapViewOfSection returned %x\n", status );
+    status = pNtUnmapViewOfSection( hProcess, ptr2 );
+    ok( !status, "NtUnmapViewOfSection failed status %x\n", status );
 
     if (sizeof(void *) == sizeof(int) && (!pIsWow64Process ||
         !pIsWow64Process( GetCurrentProcess(), &is_wow64 ) || !is_wow64))
